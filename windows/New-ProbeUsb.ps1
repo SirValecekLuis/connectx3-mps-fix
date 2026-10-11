@@ -1,0 +1,138 @@
+<#
+.SYNOPSIS
+  Step 2: prepares a USB stick that boots the UEFI Shell and records - READ-ONLY - the PCI configuration space of
+  the Mellanox card and of the PCIe root port above it, exactly as the BIOS leaves them before Windows starts.
+
+.DESCRIPTION
+  Nothing on the PC is changed by this script. It only writes to the USB stick:
+    \EFI\BOOT\BOOTX64.EFI and \shellx64.efi   UEFI Shell (downloaded from github.com/pbatard/UEFI-Shell, SHA256 pinned)
+    \startup.nsh and \EFI\BOOT\startup.nsh     the probe script (uses only 'mm ... -n' READS, writes no PCI register)
+    \mpsfix\probe-config.txt                   which devices are probed
+  After booting the stick, the results are in \mpsfix\probe.txt - feed that file to Install-MpsFix.ps1.
+
+.PARAMETER UsbDrive    Drive letter of a FAT32 formatted USB stick, e.g. E:   (UEFI firmware cannot read exFAT/NTFS)
+.PARAMETER InstanceId  PnP instance id of the card - only needed if more than one Mellanox device is present
+.PARAMETER ShellPath   Use a local shellx64.efi instead of downloading it (its SHA256 is still verified)
+.PARAMETER Force       Overwrite an existing \EFI\BOOT\BOOTX64.EFI on the stick
+.PARAMETER PreviewDir  Do not touch any USB stick: only write the generated probe script + config into this folder
+                       (to inspect what would be put on the stick)
+
+.EXAMPLE
+  .\New-ProbeUsb.ps1 -UsbDrive E:
+  .\New-ProbeUsb.ps1 -PreviewDir .\probe-preview
+#>
+param(
+    [string]$UsbDrive,
+    [string]$InstanceId,
+    [string]$ShellPath,
+    [switch]$Force,
+    [string]$PreviewDir
+)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'MpsFix.Common.ps1')
+
+try {
+    if (-not $UsbDrive -and -not $PreviewDir) { throw 'Give -UsbDrive E: (FAT32 USB stick) or -PreviewDir <folder>.' }
+    if ($PreviewDir) { $UsbDrive = $null }
+    # ---- the USB stick ----
+    if ($UsbDrive) {
+    $letter = $UsbDrive.TrimEnd('\', ':').ToUpper()
+    if ($letter -notmatch '^[D-Z]$') { throw "UsbDrive must be a drive letter like E: (got '$UsbDrive')" }
+    if ("$($letter):" -eq $env:SystemDrive) { throw 'That is the Windows drive, not a USB stick.' }
+    $vol = Get-Volume -DriveLetter $letter
+    $disk = Get-Disk -Number (Get-Partition -DriveLetter $letter).DiskNumber
+    if ($disk.BusType -ne 'USB') { throw "Drive $($letter): is not a USB device (bus type $($disk.BusType))." }
+    if ($vol.FileSystem -ne 'FAT32') { throw "Drive $($letter): is $($vol.FileSystem). UEFI firmware only reads FAT32 - reformat it (e.g. Rufus: Boot selection 'Non bootable', Partition scheme MBR, File system 'Large FAT32')." }
+    $root = "$($letter):\"
+    if ((Test-Path "$root\EFI\BOOT\BOOTX64.EFI") -and -not $Force) {
+        $h = (Get-FileHash "$root\EFI\BOOT\BOOTX64.EFI").Hash
+        if ($h -ne $script:ShellSha256) { throw "The stick already contains a bootable \EFI\BOOT\BOOTX64.EFI (another OS installer?). Use an empty stick or -Force." }
+    }
+    }
+
+    # ---- the card and its root port ----
+    $cards = @(Get-MellanoxCards)
+    if ($InstanceId) { $cards = @($cards | Where-Object { $_.InstanceId -eq $InstanceId }) }
+    if ($cards.Count -eq 0) { throw 'No Mellanox (vendor 15B3) network adapter found.' }
+    if ($cards.Count -gt 1) { $cards | ForEach-Object { Write-Host "  $($_.InstanceId)  $($_.FriendlyName)" }; throw 'More than one Mellanox device - pick one with -InstanceId.' }
+    $card = $cards[0]
+    $cl = Get-PciLocation $card.InstanceId
+    $rpId = Get-RootPortOf $card.InstanceId
+    $rl = Get-PciLocation $rpId
+    Write-Host "Card       : $($card.FriendlyName)  [$($cl.Text)]  status=$($card.Status)"
+    Write-Host "Root port  : $((Get-PnpDevice -InstanceId $rpId).FriendlyName)  [$($rl.Text)]"
+    $hw = ($card.InstanceId -split '\\')[1]
+    if ($hw -notmatch 'DEV_(1003|1007)') { Write-Host "Note: this is not a ConnectX-3 / ConnectX-3 Pro ($hw). The probe is harmless, but the fix was only tested on ConnectX-3 Pro." -ForegroundColor Yellow }
+
+    # ---- UEFI Shell ----
+    $tmp = Join-Path $env:TEMP ('mpsfix-shell-' + [guid]::NewGuid().ToString('N') + '.efi')
+    if ($PreviewDir) { }
+    elseif ($ShellPath) { Copy-Item $ShellPath $tmp }
+    else {
+        Write-Host "Downloading UEFI Shell: $($script:ShellUrl)"
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $script:ShellUrl -OutFile $tmp -UseBasicParsing
+    }
+    if (-not $PreviewDir -and (Get-FileHash $tmp).Hash -ne $script:ShellSha256) { Remove-Item $tmp -Force; throw 'UEFI Shell SHA256 mismatch - not using it.' }
+
+    # ---- probe script (READ-ONLY: only 'mm <address> -pci -w 4 -n' reads) ----
+    $out = '%usb%\mpsfix\probe.txt'
+    $nsh = New-Object Collections.Generic.List[string]
+    $nsh.Add('@echo -off')
+    $nsh.Add('# PCIe MPS probe - READ-ONLY. Records the first 256 bytes of PCI config space of the card and of its')
+    $nsh.Add('# root port as the BIOS left them. Generated by New-ProbeUsb.ps1 (connectx3-mps-fix).')
+    $nsh.Add('set -v usb none')
+    $nsh.Add('set -v win none')
+    $nsh.Add('for %i run (0 15)')
+    $nsh.Add('  if exist fs%i:\mpsfix\probe-config.txt then')
+    $nsh.Add('    set -v usb fs%i:')
+    $nsh.Add('  endif')
+    $nsh.Add('  if exist fs%i:\EFI\Microsoft\Boot\bootmgfw.efi then')
+    $nsh.Add('    set -v win fs%i:')
+    $nsh.Add('  endif')
+    $nsh.Add('endfor')
+    $nsh.Add('if "%usb%" == "none" then')
+    $nsh.Add('  echo "mpsfix: probe files not found on the stick"')
+    $nsh.Add('else')
+    $nsh.Add('  echo "mpsfix: reading PCI config space - read only, please wait"')
+    $nsh.Add("  echo `"CARD $($cl.Text)`" >a $out")
+    for ($r = 0; $r -lt 256; $r += 4) { $nsh.Add("  mm $(Format-MmPci $cl $r) -pci -w 4 -n >>a $out") }
+    $nsh.Add("  echo `"ROOTPORT $($rl.Text)`" >>a $out")
+    for ($r = 0; $r -lt 256; $r += 4) { $nsh.Add("  mm $(Format-MmPci $rl $r) -pci -w 4 -n >>a $out") }
+    $nsh.Add("  echo `"END`" >>a $out")
+    $nsh.Add('  echo "mpsfix: done - results are in \mpsfix\probe.txt on the stick"')
+    $nsh.Add('endif')
+    $nsh.Add('echo "Press any key to start Windows - q stays in the shell"')
+    $nsh.Add('pause')
+    $nsh.Add('if not "%win%" == "none" then')
+    $nsh.Add('  %win%\EFI\Microsoft\Boot\bootmgfw.efi')
+    $nsh.Add('endif')
+    $nsh.Add('exit')
+    $nshText = ($nsh -join "`r`n") + "`r`n"
+
+    $cfg = "card=$($cl.Text)`r`nrootport=$($rl.Text)`r`ncreated=$(Get-Date -Format s)`r`ntool=connectx3-mps-fix New-ProbeUsb.ps1`r`n"
+    if ($PreviewDir) {
+        New-Item -ItemType Directory -Force (Join-Path $PreviewDir 'mpsfix') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $PreviewDir 'startup.nsh'), $nshText, [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText((Join-Path $PreviewDir 'mpsfix\probe-config.txt'), $cfg, [Text.Encoding]::ASCII)
+        Write-Host "Preview written to $PreviewDir (no USB stick touched)." -ForegroundColor Green
+        exit 0
+    }
+
+    # ---- write the stick ----
+    New-Item -ItemType Directory -Force "$root\EFI\BOOT", "$root\mpsfix" | Out-Null
+    Copy-Item $tmp "$root\EFI\BOOT\BOOTX64.EFI" -Force; Copy-Item $tmp "$root\shellx64.efi" -Force; Remove-Item $tmp -Force
+    foreach ($p in "$root\startup.nsh", "$root\EFI\BOOT\startup.nsh") { [IO.File]::WriteAllText($p, $nshText, [Text.Encoding]::ASCII) }
+    [IO.File]::WriteAllText("$root\mpsfix\probe-config.txt", $cfg, [Text.Encoding]::ASCII)
+    if (Test-Path "$root\mpsfix\probe.txt") { Remove-Item "$root\mpsfix\probe.txt" -Force }
+
+    Write-Host ''
+    Write-Host "Probe stick ready on $($letter):" -ForegroundColor Green
+    Write-Host '  1. Keep your normal BIOS settings. Restart and open the boot menu (ASRock: F11), choose "UEFI: <your stick>".'
+    Write-Host '  2. Do not press anything during the 5 s countdown. The probe only READS, then asks for a key and starts Windows.'
+    Write-Host "  3. In Windows run 2-FIX.cmd again (or: .\Install-MpsFix.ps1 -ProbeFile $($letter):\mpsfix\probe.txt -GenerateOnly)"
+    exit 0
+} catch {
+    Write-Host "ERROR: $_" -ForegroundColor Red
+    exit 1
+}
